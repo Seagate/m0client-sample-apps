@@ -167,7 +167,7 @@ echo "# Application: All"
 echo "#"
 
 echo
-echo "HA_ENDPOINT_ADDR = ${p[0]}"
+echo "HA_ENDPOINT_ADDR = ${p[5]%@*}@${p[0]#*@}"
 echo "PROFILE_FID = ${p[1]}"
 
 echo
@@ -183,9 +183,9 @@ idx=0; while read line; do
 	fi
 
 	# match config for m0_client
-	if [[ ! -z "$(echo ${line} | grep m0_client)" ]]; then
-		fid=$(echo ${line} | awk '{print $3;}')
-		addr=$(echo ${line} | awk '{print $4;}')
+	if [[ ! -z "$(echo "${line}" | grep m0_client)" ]]; then
+		fid=$(echo "${line}" | awk '{print $3;}')
+		addr=$(echo "${line}" | awk '{print $4;}')
 		echo "LOCAL_ENDPOINT_ADDR$((idx)) = ${addr}"
 		echo "LOCAL_PROC_FID$((idx++)) = ${fid}"
 	fi
