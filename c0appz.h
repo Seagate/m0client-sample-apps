@@ -50,6 +50,11 @@ int c0appz_free(void);
 int open_entity(struct m0_entity *entity);
 
 /**
+ * Return parity group size for object.
+ */
+uint64_t c0appz_m0gs(struct m0_obj *obj, int tier);
+
+/**
  * Calculate the optimal block size for the object store I/O
  *
  * @param idhi high number of the object id

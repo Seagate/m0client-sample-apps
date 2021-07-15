@@ -1,89 +1,79 @@
+Preparing computations library
+==============================
 
+Computations from an external library cannot be linked directly with
+a Motr instance. The library is supposed to have an entry function named
+``void motr_lib_init(void)``. All the computations in the library must
+have the following signature::
 
-Preparing a library
+  int comp(struct m0_buf *args, struct m0_buf *out,
+           struct m0_isc_comp_private *comp_data, int *rc)
+
+See isc_libdemo.c for examples.
+
+Loading the library
 ===================
 
-APIs from an external library can't be linked directly with a motr instance.
-A library is supposed to have a function named "void motr_lib_init(void)".
-All APIs from a library shall confine to the following signature:
+With ``spiel`` command (see spiel/spiel.h and c0appz_isc.h) the library
+can be loaded with any running Motr instance. A helper function
+``c0appz_isc_api_register`` (see c0appz_isc.h) takes the library path which
+is (IMPORTANT!) expected to be the same across all the nodes running Motr.
 
-int comp(struct m0_buf *args, struct m0_buf *out,
-         struct m0_isc_comp_private *comp_data, int *rc)
+Currently, a utility ``c0isc_reg`` takes the path as an input and loads
+the library into all the remote Motr instances.
 
-See isc_lib_demo.c for a usecase.
+On successful loading of the library, the output will look like this::
 
-Loading a library
-=================
-
-Using a spiel command (@see "spiel/spiel.h" and "c0appz_isc.h") a library can
-be loaded with any running motr instance. A helper function
-"c0appz_isc_api_register" (c0appz_isc.h) takes a path of the library, which is
-expected to be identical across all the nodes hosting a motr instance. Currently
-a utility c0isc_reg takes the path as an input and loads the library with remote
-motr instances.
-
-On successful loading of the library the output looks like:
-
-++++++++++++++++++++++++++++++
-$ ./c0isc_reg $PWD/libdemo.so
-c0isc_reg success
-++++++++++++++++++++++++++++++
+  $ ./c0isc_reg $PWD/libdemo.so
+  c0isc_reg success
 
 Demo computations
 =================
 
-Currently we demonstrate three simple computations. The utility c0isc_demo can
-be used to invoke any of the computations supported. Following are the steps
-to view the demo output.
-1. make isc-clean
-2. make isc-all
+Currently, we demonstrate three simple computations: ``ping``, ``min`` and
+``max``. ``c0isc_demo`` utility can be used to invoke the computations and
+see the result::
 
-The second step builds a library libdemo.so
+  $ ./c0isc_demo
+
+  Usage: c0isc_demo [-v[v]] COMP OBJ LEN
+
+    Supported COMPutations: ping, min, max.
+
+    OBJ is two uint64 numbers in format: hi:lo.
+    LEN is the length of object (in KiB).
+
+To build the utility and ``libdemo.so`` library, run::
+
+  make isc-all
+
+Following are the steps to view the demo output.
 
 ping
 ----
-This functionality pings all ISC services present in Motr configuration and
-returns "Hello-World@<service-fid>" till it encounters a service that's down.
+
+This functionality pings all the ISC services spanned by the object units.
+For each unit a separate ping request is sent, so the utility prints
+"Hello-World@<service-fid>" reply each of these requests.
+
+Here is an example for the object with 1MB units::
+
+  $ ./c0isc_demo ping 123:12371 4096
+  Hello-world @192.168.180.171@tcp:12345:2:2
+  Hello-world @192.168.180.171@tcp:12345:2:2
+  Hello-world @192.168.180.171@tcp:12345:2:2
+  Hello-world @192.168.180.171@tcp:12345:2:2
+
+Note: the object length (or the amount to read) must be specified, as Motr
+does not store the objects lengths in their metadata.
 
 min / max
 ---------
 
-This functionality reads a file (c0isc_data) co-located with the utility and
-identifies the min or max depending upon the input option provided. On
-successful completion it shows following output format:
+Write an object with a real numbers strings delimited by the newline.
+The min/max in-storage computation can then be done on such object::
 
-+++++++++++++++++++++
-$ ./c0isc_demo min
-idx=0 val=1.100000
-$ ./c0isc_demo max
-idx=2 val=3.300000
-+++++++++++++++++++++
-
-The numbers in c0isc_data file are stored in text format delimited by space
-(or newline): first integer specifies the number of elements followed by
-the floating point elements themselves. For example:
-
-+++++++++++++++++++
-$ cat c0isc_data
-3
-1.1
-2.2
-3.3
-+++++++++++++++++++
-
-What's not present ?
-====================
-
-Data serialisation is necessary for communicating with remote service. Motr
-serialises using gccxml and an internal utility gccxml2xcode. Incorporating
-this utility in Motr rpm is currently scheduled and not part of current
-Motr master. The demo includes a simplistic serialisation technique and
-is not scalable as is.
-
-Async communication with remote services is possible but the demo does not
-include the same. For that kindly review cases from iscservice/ut/service_ut.c
-
-Currently conducting an IO from server-side is not easily doable. It requires all
-the operations that ioservice conducts needs to be  done. A simplified API
-for server side IO is under progress. Hence result of the computation can not
-be persisted as of now.
+  $ ./c0isc_demo max 123:12371 4096
+  idx=132151 val=32767.627900
+  $ ./c0isc_demo min 123:12371 4096
+  idx=180959 val=0.134330

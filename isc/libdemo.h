@@ -22,18 +22,39 @@
  */
 
 #include "lib/types.h"
+#include "lib/buf.h"
+#include "lib/buf_xc.h"
+#include "fid/fid.h"
+#include "fid/fid_xc.h"
+#include "lib/vec.h"
+#include "lib/vec_xc.h"
 #include "xcode/xcode_attr.h"
 
-/** Holds the result of min and max computations. */
+/**
+ * Holds the result of min and max computations.
+ *
+ * The left and right cuts of the values which cross
+ * the units boundaries should be glued by the client code
+ * and included in the final computation also.
+ */
 struct mm_result {
-	uint32_t mr_idx;
-	double   mr_val;
+	/** Index of the resulting element. */
+	uint64_t      mr_idx;
+	/** Total number of elements. */
+	uint64_t      mr_nr;
+	/** The resulting value of the computation. */
+	double        mr_val;
+	/** Right cut of the boundary value on the left side of unit. */
+	struct m0_buf mr_lbuf;
+	/** Left cut of the boundary value on the right side of unit. */
+	struct m0_buf mr_rbuf;
 } M0_XCA_RECORD;
 
-struct isc_args {
-	uint32_t ia_len;
-	double  *ia_arr;
-} M0_XCA_SEQUENCE;
+/** Arguments to the target ISC service. */
+struct isc_targs {
+	struct m0_fid         ist_cob;
+	struct m0_io_indexvec ist_ioiv;
+} M0_XCA_RECORD;
 
 /*
  *  Local variables:

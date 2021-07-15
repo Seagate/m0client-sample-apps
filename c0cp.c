@@ -106,7 +106,6 @@ int main(int argc, char **argv)
 
 	prog = basename(strdup(argv[0]));
 
-	/* getopt */
 	while ((opt = getopt(argc, argv, ":a:b:pfc:x:u:tvh")) != -1) {
 		switch (opt) {
 		case 'p':

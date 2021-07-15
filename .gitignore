@@ -5,7 +5,6 @@
 *.a
 *.so
 *~
-help.h
 cscope.*
 m0trace.*
 core.*

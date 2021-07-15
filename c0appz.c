@@ -38,6 +38,7 @@
 #include <lib/mutex.h>
 #include <sys/user.h>           /* PAGE_SIZE */
 
+#include "lib/types.h"        /* uint32_t */
 #include "motr/client.h"
 #include "motr/client_internal.h"
 #include "conf/confc.h"       /* m0_confc_open_sync */
@@ -47,7 +48,7 @@
 #include "conf/obj_ops.h"     /* M0_CONF_DIREND */
 #include "spiel/spiel.h"      /* m0_spiel_process_lib_load */
 #include "reqh/reqh.h"        /* m0_reqh */
-#include "lib/types.h"        /* uint32_t */
+#include "layout/plan.h"      /* m0_layout_io_plop */
 
 #include "c0appz.h"
 #include "c0appz_internal.h"
@@ -227,6 +228,37 @@ static uint64_t roundup_power2(uint64_t x)
 	return power;
 }
 
+static int64_t get_lid_by_bs(uint64_t bs, int tier)
+{
+	int                     rc;
+	int64_t                 lid;
+	struct m0_reqh         *reqh = &m0_instance->m0c_reqh;
+	struct m0_pool_version *pver;
+	struct m0_fid          *pool = tier2pool(tier);
+
+	DBG("tier=%d pool=%s\n", tier, fid2str(pool));
+	rc = m0_pool_version_get(reqh->rh_pools, pool, &pver);
+	if (rc != 0) {
+		ERR("m0_pool_version_get(pool=%s) failed: rc=%d\n",
+		    fid2str(pool), rc);
+		return rc;
+	}
+
+	if (unit_size)
+		lid = m0_client_layout_id(m0_instance);
+	else
+		lid = m0_layout_find_by_buffsize(&reqh->rh_ldom, &pver->pv_id,
+						 bs);
+
+	DBG("pool="FID_F" width=%u parity=(%u+%u) unit=%dK m0bs=%luK\n",
+	    FID_P(&pver->pv_pool->po_id), pver->pv_attr.pa_P,
+	    pver->pv_attr.pa_N, pver->pv_attr.pa_K,
+	    m0_obj_layout_id_to_unit_size(lid) / 1024, bs / 1024);
+
+	return lid;
+}
+
+
 /*
  ******************************************************************************
  * EXTERN FUNCTIONS
@@ -234,21 +266,21 @@ static uint64_t roundup_power2(uint64_t x)
  */
 
 /**
- * Calculate the optimal block size for the object store I/O
+ * Calculate the optimal block size for the object store I/O.
+ * k - is coefficient which signifies how deep the IO request can
+ * be on the given pool width. Or, in another words, how many units
+ * can happen in the same target IO request.
  */
-uint64_t c0appz_m0bs(uint64_t idhi, uint64_t idlo, uint64_t obj_sz, int tier)
+static uint64_t calc_m0bs(unsigned lid, uint64_t obj_sz, int tier, int k)
 {
 	int                     rc;
-	int                     k;
 	unsigned long           usz; /* unit size */
 	unsigned long           gsz; /* data units in parity group */
 	uint64_t                max_bs;
-	unsigned                lid;
 	struct m0_reqh         *reqh = &m0_instance->m0c_reqh;
 	struct m0_pool_version *pver;
 	struct m0_pdclust_attr *pa;
 	struct m0_fid          *pool = tier2pool(tier);
-	struct m0_obj           obj;
 
 	if (obj_sz > MAX_M0_BUFSZ)
 		obj_sz = MAX_M0_BUFSZ;
@@ -260,29 +292,9 @@ uint64_t c0appz_m0bs(uint64_t idhi, uint64_t idlo, uint64_t obj_sz, int tier)
 		return 0;
 	}
 
-	if (c0appz_ex(idhi, idlo, &obj))
-		lid = obj.ob_attr.oa_layout_id;
-	else if (unit_size) /* set explicitly via -u option ? */
-		lid = m0_client_layout_id(m0_instance);
-	else
-		lid = m0_layout_find_by_buffsize(&reqh->rh_ldom, &pver->pv_id,
-						 obj_sz);
-
 	usz = m0_obj_layout_id_to_unit_size(lid);
 	pa = &pver->pv_attr;
 	gsz = usz * pa->pa_N;
-	/*
-	 * The buffer should be max 4-times pool-width deep counting by
-	 * 1MB units, otherwise we may get -E2BIG from Motr BE subsystem
-	 * when there are too many units in one fop and the transaction
-	 * grow too big.
-	 *
-	 * Also, the bigger is unit size - the bigger transaction it may
-	 * require. LNet maximum frame size is 1MB, so, for example, 2MB
-	 * unit will be sent by two LNet frames and will make bigger BE
-	 * transaction.
-	 */
-	k = 8 / (usz / 0x80000 ?: 1);
 	max_bs = usz * k * pa->pa_P * pa->pa_N / (pa->pa_N + 2 * pa->pa_K);
 	max_bs = max_bs / gsz * gsz; /* make it multiple of group size */
 
@@ -295,6 +307,69 @@ uint64_t c0appz_m0bs(uint64_t idhi, uint64_t idlo, uint64_t obj_sz, int tier)
 		return gsz;
 	else
 		return roundup_power2(obj_sz);
+}
+
+/**
+ * Return parity group size for object.
+ */
+uint64_t c0appz_m0gs(struct m0_obj *obj, int tier)
+{
+	int                     rc;
+	unsigned long           usz; /* unit size */
+	struct m0_reqh         *reqh = &m0_instance->m0c_reqh;
+	struct m0_pool_version *pver;
+	struct m0_fid          *pool = tier2pool(tier);
+
+	rc = m0_pool_version_get(reqh->rh_pools, pool, &pver);
+	if (rc != 0) {
+		ERR("m0_pool_version_get(pool=%s) failed: rc=%d\n",
+		    fid2str(pool), rc);
+		return 0;
+	}
+
+	usz = m0_obj_layout_id_to_unit_size(obj->ob_attr.oa_layout_id);
+
+	return usz * pver->pv_attr.pa_N;
+}
+
+/**
+ * Calculate the optimal block size for the object store I/O
+ */
+uint64_t c0appz_m0bs(uint64_t hi, uint64_t lo, uint64_t osz, int tier)
+{
+	int64_t          lid;
+	unsigned long    usz; /* unit size */
+	struct m0_obj    obj;
+
+	if (c0appz_ex(hi, lo, &obj))
+		lid = obj.ob_attr.oa_layout_id;
+	else if (unit_size) /* set explicitly via -u option ? */
+		lid = m0_client_layout_id(m0_instance);
+	else
+		lid = get_lid_by_bs(osz, tier);
+
+	if (lid <= 0) {
+		ERR("cannot figure out the layout id\n");
+		return 0;
+	}
+
+	usz = m0_obj_layout_id_to_unit_size(lid);
+
+	/*
+	 * The buffer should be max 4-times pool-width deep counting by
+	 * 1MB units, otherwise we may get -E2BIG from Motr BE subsystem
+	 * when there are too many units in one fop and the transaction
+	 * grow too big.
+	 *
+	 * Also, the bigger is unit size - the bigger transaction it may
+	 * require. LNet maximum frame size is 1MB, so, for example, 2MB
+	 * unit will be sent by two LNet frames and will make bigger BE
+	 * transaction. That's why k is decreased for bigger units, and
+	 * increased for smaller units.
+	 */
+	int k = 8 / (usz / 0x80000 ?: 1);
+
+	return calc_m0bs(lid, osz, tier, k);
 }
 
 void free_segs(struct m0_bufvec *data, struct m0_indexvec *ext,
@@ -546,7 +621,7 @@ int c0appz_cp_async(uint64_t idhi, uint64_t idlo, char *src, uint64_t bsz,
  * cat object.
  */
 int c0appz_cat(uint64_t idhi, uint64_t idlo, char *filename,
-	      uint64_t bsz, uint64_t cnt, uint64_t m0bs)
+	       uint64_t bsz, uint64_t cnt, uint64_t m0bs)
 {
 	int                rc=0;
 	uint32_t           cnt_per_op;
@@ -727,15 +802,14 @@ static bool conf_obj_is_svc(const struct m0_conf_obj *obj)
 	return m0_conf_obj_type(obj) == &M0_CONF_SERVICE_TYPE;
 }
 
-struct m0_rpc_link * c0appz_isc_rpc_link_get(struct m0_fid *svc_fid)
+struct m0_rpc_link * c0appz_svc_rpc_link_get(struct m0_fid *svc_fid)
 {
 	struct m0_reqh *reqh = &m0_instance->m0c_reqh;
 	struct m0_reqh_service_ctx *ctx;
 	struct m0_pools_common *pc = reqh->rh_pools;
 
 	m0_tl_for(pools_common_svc_ctx, &pc->pc_svc_ctxs, ctx) {
-		if (ctx->sc_type == M0_CST_ISCS &&
-		    m0_fid_eq(&ctx->sc_fid, svc_fid))
+		if (m0_fid_eq(&ctx->sc_fid, svc_fid))
 			return &ctx->sc_rlink;
 	} m0_tl_endfor;
 
@@ -808,49 +882,38 @@ int c0appz_isc_api_register(const char *libpath)
 int c0appz_isc_nxt_svc_get(struct m0_fid *svc_fid, struct m0_fid *nxt_fid,
 			   enum m0_conf_service_type s_type)
 {
-	struct m0_reqh             *reqh       = &m0_instance->m0c_reqh;
 	struct m0_reqh_service_ctx *ctx;
-	struct m0_pools_common     *pc         = reqh->rh_pools;
-	struct m0_fid               null_fid   = M0_FID0;
+	struct m0_reqh             *reqh = &m0_instance->m0c_reqh;
+	struct m0_pools_common     *pc = reqh->rh_pools;
 	struct m0_fid               current_fid = *svc_fid;
 
 	m0_tl_for(pools_common_svc_ctx, &pc->pc_svc_ctxs, ctx) {
-		if (ctx->sc_type == s_type && m0_fid_eq(&current_fid,
-							&null_fid)) {
-			*nxt_fid = ctx->sc_fid;
-			return 0;
-		} else if (ctx->sc_type == s_type &&
-		           m0_fid_eq(svc_fid, &ctx->sc_fid))
-			current_fid = null_fid;
+		if (ctx->sc_type == s_type) {
+			if (m0_fid_eq(&current_fid, &M0_FID0)) {
+				*nxt_fid = ctx->sc_fid;
+				return 0;
+			} else if (m0_fid_eq(svc_fid, &ctx->sc_fid))
+				current_fid = M0_FID0;
+		}
 	} m0_tl_endfor;
-	*nxt_fid = M0_FID0;
 
+	*nxt_fid = M0_FID0;
 	return -ENOENT;
 }
 
 int c0appz_isc_req_prepare(struct c0appz_isc_req *req, struct m0_buf *args,
 			   const struct m0_fid *comp_fid,
-			   struct m0_buf *reply_buf, struct m0_fid *svc_fid,
-			   uint32_t reply_len)
+			   struct m0_layout_io_plop *iop, uint32_t reply_len)
 {
-
+	struct m0_rpc_session *sess = iop->iop_session;
 	struct m0_fop_isc  *fop_isc = &req->cir_isc_fop;
 	struct m0_fop      *arg_fop = &req->cir_fop;
-	struct m0_rpc_link *link;
 	int                 rc;
 
-	req->cir_args = args;
-	req->cir_result = reply_buf;
+	req->cir_plop = &iop->iop_base;
 	fop_isc->fi_comp_id = *comp_fid;
-	req->cir_rpc_link = c0appz_isc_rpc_link_get(svc_fid);
-	if (req->cir_rpc_link == NULL) {
-		fprintf(stderr, "error! cannot find rpc_link for isc service "
-			FID_F, FID_P(svc_fid));
-		return -EINVAL;
-	}
-	link = req->cir_rpc_link;
 	m0_rpc_at_init(&fop_isc->fi_args);
-	rc = m0_rpc_at_add(&fop_isc->fi_args, args, &link->rlk_conn);
+	rc = m0_rpc_at_add(&fop_isc->fi_args, args, sess->s_conn);
 	if (rc != 0) {
 		m0_rpc_at_fini(&fop_isc->fi_args);
 		fprintf(stderr, "error! m0_rpc_at_add() failed with %d\n", rc);
@@ -858,8 +921,7 @@ int c0appz_isc_req_prepare(struct c0appz_isc_req *req, struct m0_buf *args,
 	}
 	/* Initialise the reply RPC AT buffer to be received.*/
 	m0_rpc_at_init(&fop_isc->fi_ret);
-	rc = m0_rpc_at_recv(&fop_isc->fi_ret, &link->rlk_conn,
-			    reply_len, false);
+	rc = m0_rpc_at_recv(&fop_isc->fi_ret, sess->s_conn, reply_len, false);
 	if (rc != 0) {
 		m0_rpc_at_fini(&fop_isc->fi_args);
 		m0_rpc_at_fini(&fop_isc->fi_ret);
@@ -867,6 +929,90 @@ int c0appz_isc_req_prepare(struct c0appz_isc_req *req, struct m0_buf *args,
 		return rc;
 	}
 	m0_fop_init(arg_fop, &m0_fop_isc_fopt, fop_isc, m0_fop_release);
+	req->cir_rpc_sess = sess;
+
+	return rc;
+}
+
+void isc_req_replied(struct m0_rpc_item *item)
+{
+	int                    rc;
+	struct m0_fop         *fop = M0_AMB(fop, item, f_item);
+	struct m0_fop         *reply_fop;
+	struct m0_fop_isc_rep *isc_reply;
+	struct c0appz_isc_req *req = M0_AMB(req, fop, cir_fop);
+	const char *addr = m0_rpc_conn_addr(req->cir_rpc_sess->s_conn);
+
+	if (item->ri_error != 0) {
+		req->cir_rc = item->ri_error;
+		fprintf(stderr,
+			"No reply from %s: rc=%d.\n", addr, item->ri_error);
+		goto err;
+	}
+	reply_fop = m0_rpc_item_to_fop(req->cir_fop.f_item.ri_reply);
+	isc_reply = (struct m0_fop_isc_rep *)m0_fop_data(reply_fop);
+	rc = req->cir_rc = isc_reply->fir_rc;
+	if (rc != 0) {
+		fprintf(stderr,
+			"Got error in reply from %s: rc=%d.\n", addr, rc);
+		if (rc == -ENOENT)
+			fprintf(stderr, "Was isc .so library is loaded?\n");
+		goto err;
+	}
+	rc = m0_rpc_at_rep_get(&req->cir_isc_fop.fi_ret, &isc_reply->fir_ret,
+			       &req->cir_result);
+	if (rc != 0)
+		fprintf(stderr,
+			"rpc_at_rep_get() from %s failed: rc=%d\n", addr, rc);
+ err:
+	m0_fop_put(&req->cir_fop);
+	m0_semaphore_up(req->cir_sem);
+}
+
+struct m0_semaphore isc_sem;
+struct m0_list      isc_reqs;
+
+static const struct m0_rpc_item_ops isc_item_ops = {
+	.rio_replied = isc_req_replied,
+};
+
+static void ireqs_list_add_in_order(struct c0appz_isc_req *req)
+{
+	struct c0appz_isc_req *r;
+	struct m0_layout_io_plop *pl1;
+	struct m0_layout_io_plop *pl2 = M0_AMB(pl2, req->cir_plop, iop_base);
+
+	m0_list_for_each_entry(&isc_reqs, r, struct c0appz_isc_req, cir_link) {
+		pl1 = M0_AMB(pl1, r->cir_plop, iop_base);
+		if (pl1->iop_goff > pl2->iop_goff)
+			break;
+	}
+	m0_list_add_before(&r->cir_link, &req->cir_link);
+}
+
+int c0appz_isc_req_send(struct c0appz_isc_req *req)
+{
+	int                    rc;
+	struct m0_rpc_item    *item;
+
+	req->cir_sem = &isc_sem;
+
+	item              = &req->cir_fop.f_item;
+	item->ri_session  = req->cir_rpc_sess;
+	item->ri_prio     = M0_RPC_ITEM_PRIO_MID;
+	item->ri_deadline = M0_TIME_IMMEDIATELY;
+	item->ri_nr_sent_max = M0_RPCLIB_MAX_RETRIES;
+	item->ri_ops      = &isc_item_ops;
+
+	m0_fop_get(&req->cir_fop);
+	rc = m0_rpc_post(item);
+	if (rc != 0) {
+		fprintf(stderr, "Failed to send request to %s: rc=%d\n",
+			m0_rpc_conn_addr(req->cir_rpc_sess->s_conn), rc);
+		m0_fop_put(&req->cir_fop);
+	}
+
+	ireqs_list_add_in_order(req);
 
 	return rc;
 }
@@ -877,24 +1023,24 @@ int c0appz_isc_req_send_sync(struct c0appz_isc_req *req)
 	struct m0_fop_isc_rep  isc_reply;
 	int                    rc;
 
-	rc = m0_rpc_post_sync(&req->cir_fop, &req->cir_rpc_link->rlk_sess, NULL,
+	rc = m0_rpc_post_sync(&req->cir_fop, req->cir_rpc_sess, NULL,
 			      M0_TIME_IMMEDIATELY);
 	if (rc != 0) {
-		fprintf(stderr, "Failed to send request to "FID_F": rc=%d\n",
-			FID_P(&req->cir_proc), rc);
+		fprintf(stderr, "Failed to send request to %s: rc=%d\n",
+			m0_rpc_conn_addr(req->cir_rpc_sess->s_conn), rc);
 		return rc;
 	}
 	reply_fop = m0_rpc_item_to_fop(req->cir_fop.f_item.ri_reply);
 	isc_reply = *(struct m0_fop_isc_rep *)m0_fop_data(reply_fop);
-	req->cir_rc = isc_reply.fir_rc;
-	if (req->cir_rc != 0)
-		fprintf(stderr, "Got error from "FID_F": rc=%d\n",
-			FID_P(&req->cir_proc), rc);
-	rc = m0_rpc_at_rep_get(&req->cir_isc_fop.fi_ret, &isc_reply.fir_ret,
-			       req->cir_result);
+	rc = req->cir_rc = isc_reply.fir_rc;
 	if (rc != 0)
-		fprintf(stderr, "rpc_at_rep_get() from "FID_F" failed: rc=%d\n",
-			FID_P(&req->cir_proc), rc);
+		fprintf(stderr, "Got error from %s: rc=%d\n",
+			m0_rpc_conn_addr(req->cir_rpc_sess->s_conn), rc);
+	rc = m0_rpc_at_rep_get(&req->cir_isc_fop.fi_ret, &isc_reply.fir_ret,
+			       &req->cir_result);
+	if (rc != 0)
+		fprintf(stderr, "rpc_at_rep_get() from %s failed: rc=%d\n",
+			m0_rpc_conn_addr(req->cir_rpc_sess->s_conn), rc);
 
 	return req->cir_rc == 0 ? rc : req->cir_rc;
 }
@@ -910,9 +1056,10 @@ static void fop_fini_lock(struct m0_fop *fop)
 
 void c0appz_isc_req_fini(struct c0appz_isc_req *req)
 {
-	struct m0_fop *reply_fop;
+	struct m0_fop *reply_fop = NULL;
 
-	reply_fop = m0_rpc_item_to_fop(req->cir_fop.f_item.ri_reply);
+	if (req->cir_fop.f_item.ri_reply != NULL)
+		reply_fop = m0_rpc_item_to_fop(req->cir_fop.f_item.ri_reply);
 	if (reply_fop != NULL)
 		m0_fop_put_lock(reply_fop);
 	req->cir_fop.f_item.ri_reply = NULL;
@@ -1067,6 +1214,8 @@ int c0appz_init(int idx)
 		return rc;
 	}
 
+	m0_list_init(&isc_reqs);
+
 	/* success */
 	uber_realm = container.co_realm;
 	return 0;
@@ -1142,32 +1291,17 @@ int open_entity(struct m0_entity *entity)
 int c0appz_cr(uint64_t idhi, uint64_t idlo, int tier, uint64_t bsz)
 {
 	int                     rc;
-	unsigned                lid;
-	struct m0_reqh         *reqh = &m0_instance->m0c_reqh;
-	struct m0_pool_version *pver;
-	struct m0_op    *op = NULL;
+	int64_t                 lid;
+	struct m0_op           *op = NULL;
 	struct m0_fid          *pool = tier2pool(tier);
 	struct m0_uint128       id = {idhi, idlo};
-	struct m0_obj    obj = {};
+	struct m0_obj           obj = {};
 
-	DBG("tier=%d pool=%s\n", tier, fid2str(pool));
-	rc = m0_pool_version_get(reqh->rh_pools, pool, &pver);
-	if (rc != 0) {
-		ERR("m0_pool_version_get(pool=%s) failed: rc=%d\n",
-		    fid2str(pool), rc);
-		return rc;
+	lid = get_lid_by_bs(bsz, tier);
+	if (lid < 0) {
+		ERR("cannot figure out the layout id\n");
+		return lid;
 	}
-
-	if (unit_size)
-		lid = m0_client_layout_id(m0_instance);
-	else
-		lid = m0_layout_find_by_buffsize(&reqh->rh_ldom, &pver->pv_id,
-						 bsz);
-
-	DBG("pool="FID_F" width=%u parity=(%u+%u) unit=%dK m0bs=%luK\n",
-	    FID_P(&pver->pv_pool->po_id), pver->pv_attr.pa_P,
-	    pver->pv_attr.pa_N, pver->pv_attr.pa_K,
-	    m0_obj_layout_id_to_unit_size(lid) / 1024, bsz / 1024);
 
 	m0_obj_init(&obj, &uber_realm, &id, lid);
 
@@ -1262,9 +1396,8 @@ static int do_io_op(struct m0_obj *obj, enum m0_obj_opcode opcode,
 	m0_op_launch(&op, 1);
 
 	/* wait */
-	rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED,
-					   M0_OS_STABLE),
-			       M0_TIME_NEVER) ?: m0_rc(op);
+	rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE),
+			M0_TIME_NEVER) ?: m0_rc(op);
 
 	m0_op_fini(op);
 	m0_op_free(op);

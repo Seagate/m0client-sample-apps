@@ -78,8 +78,11 @@ uint64_t set_exts(struct m0_indexvec *ext, uint64_t off, uint64_t bsz);
 extern int trace_level;
 extern char *prog;
 
-enum {LOG_ERROR = 0,
-      LOG_DEBUG = 1};
+enum {
+	LOG_ERROR = 0,
+	LOG_DEBUG = 1,
+	LOG_DEBUG2 = 2
+};
 
 #define LOG(_fmt, ...) \
   fprintf(stderr, "%s: %s():%d: "_fmt, prog, __func__, __LINE__, ##__VA_ARGS__)
@@ -87,6 +90,7 @@ enum {LOG_ERROR = 0,
 #define ERRS(_fmt, ...) if (trace_level >= LOG_ERROR) \
 	LOG(_fmt ": %s\n", ##__VA_ARGS__, strerror(errno))
 #define DBG(_fmt, ...) if (trace_level >= LOG_DEBUG) LOG(_fmt, ##__VA_ARGS__)
+#define DBG2(_fmt, ...) if (trace_level >= LOG_DEBUG2) LOG(_fmt, ##__VA_ARGS__)
 
 #define	CHECK_BSZ_ARGS(bsz, m0bs) \
   if ((bsz) < 1 || (bsz) % PAGE_SIZE) { \
